@@ -1,6 +1,7 @@
 let videoStream = null;
 let currentDeviceId = null;
 let currentEffect = 'eye-swap';
+let isFrontCamera = false;
 let faceMesh = null;
 let camera = null;
 let canvasCtx = null;
@@ -135,6 +136,13 @@ async function startCamera(deviceId) {
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
     videoElement.srcObject = stream;
 
+    const videoTrack = stream.getVideoTracks()[0];
+    const settings = videoTrack.getSettings() || {};
+    const label = videoTrack.label ? videoTrack.label.toLowerCase() : '';
+
+    // Check if it's front camera
+    isFrontCamera = settings.facingMode === 'user' || label.includes('front') || label.includes('前面') || label.includes('selfie');
+
     await new Promise((resolve) => {
       videoElement.onloadedmetadata = () => {
         videoElement.play();
@@ -169,6 +177,12 @@ async function fallbackCamera() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
         videoElement.srcObject = stream;
+
+        const videoTrack = stream.getVideoTracks()[0];
+        const settings = videoTrack.getSettings() || {};
+        const label = videoTrack.label ? videoTrack.label.toLowerCase() : '';
+        isFrontCamera = settings.facingMode === 'user' || label.includes('front') || label.includes('前面') || label.includes('selfie');
+
         videoElement.play();
         resizeCanvas();
         camera = new Camera(videoElement, {
@@ -224,14 +238,60 @@ function drawFrame() {
   }
 
   // Draw the base video frame
-  // Note: we might need to mirror the video if it's the front camera
-  // For now, we draw it as-is.
+  canvasCtx.save();
+  if (isFrontCamera) {
+    canvasCtx.translate(width, 0);
+    canvasCtx.scale(-1, 1);
+  }
   canvasCtx.drawImage(videoElement, startX, startY, drawWidth, drawHeight);
+  canvasCtx.restore();
 
   // Apply effect
-  if (currentEffect === 'eye-swap' && lastResults && lastResults.multiFaceLandmarks && lastResults.multiFaceLandmarks.length > 0) {
-    applyGhostEffect(lastResults.multiFaceLandmarks[0], startX, startY, drawWidth, drawHeight, videoElement.videoWidth, videoElement.videoHeight);
+  if (lastResults && lastResults.multiFaceLandmarks && lastResults.multiFaceLandmarks.length > 0) {
+    const landmarks = lastResults.multiFaceLandmarks[0];
+    if (currentEffect === 'eye-swap') {
+      applyGhostEffect(landmarks, startX, startY, drawWidth, drawHeight, videoElement.videoWidth, videoElement.videoHeight);
+    } else if (currentEffect === 'eye-upside-down') {
+      applyUpsideDownEyesEffect(landmarks, startX, startY, drawWidth, drawHeight, videoElement.videoWidth, videoElement.videoHeight);
+    } else if (currentEffect === 'enlarge-iris') {
+      applyEnlargeIrisEffect(landmarks, startX, startY, drawWidth, drawHeight, videoElement.videoWidth, videoElement.videoHeight);
+    }
   }
+}
+
+function getLandmarkCanvasPos(pt, startX, startY, drawWidth, drawHeight) {
+  let x = startX + pt.x * drawWidth;
+  let y = startY + pt.y * drawHeight;
+  if (isFrontCamera) {
+    x = outputCanvas.width - x;
+  }
+  return { x, y };
+}
+
+function extractPatch(sourceX, sourceY, r) {
+  const offCanvas = document.createElement('canvas');
+  offCanvas.width = r * 2;
+  offCanvas.height = r * 2;
+  const offCtx = offCanvas.getContext('2d');
+
+  const sx = sourceX - r;
+  const sy = sourceY - r;
+
+  // Extract the square patch
+  offCtx.drawImage(outputCanvas, sx, sy, r * 2, r * 2, 0, 0, r * 2, r * 2);
+
+  // Apply radial gradient mask
+  offCtx.globalCompositeOperation = 'destination-in';
+  const gradient = offCtx.createRadialGradient(r, r, 0, r, r, r);
+  gradient.addColorStop(0, 'rgba(0, 0, 0, 1)');
+  gradient.addColorStop(0.6, 'rgba(0, 0, 0, 1)');
+  gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  offCtx.fillStyle = gradient;
+  offCtx.beginPath();
+  offCtx.arc(r, r, r, 0, Math.PI * 2);
+  offCtx.fill();
+
+  return offCanvas;
 }
 
 function applyGhostEffect(landmarks, startX, startY, drawWidth, drawHeight, videoWidth, videoHeight) {
@@ -245,11 +305,13 @@ function applyGhostEffect(landmarks, startX, startY, drawWidth, drawHeight, vide
   if (!leftEyePt || !rightEyePt) return;
 
   // Calculate coordinates relative to the canvas based on object-fit: cover logic
-  const leftX = startX + leftEyePt.x * drawWidth;
-  const leftY = startY + leftEyePt.y * drawHeight;
+  const leftPos = getLandmarkCanvasPos(leftEyePt, startX, startY, drawWidth, drawHeight);
+  const leftX = leftPos.x;
+  const leftY = leftPos.y;
 
-  const rightX = startX + rightEyePt.x * drawWidth;
-  const rightY = startY + rightEyePt.y * drawHeight;
+  const rightPos = getLandmarkCanvasPos(rightEyePt, startX, startY, drawWidth, drawHeight);
+  const rightX = rightPos.x;
+  const rightY = rightPos.y;
 
   // Approximate eye radius (distance between inner and outer corners or simply a fixed size based on face width)
   // Let's use distance between the two eyes to scale the radius dynamically
@@ -259,35 +321,9 @@ function applyGhostEffect(landmarks, startX, startY, drawWidth, drawHeight, vide
   // Since we are extracting from the main canvas itself, doing it sequentially overwrites the second eye.
   // We need to extract BOTH eyes first before drawing them to their new locations.
 
-  function extractEye(sourceX, sourceY, r) {
-    const offCanvas = document.createElement('canvas');
-    offCanvas.width = r * 2;
-    offCanvas.height = r * 2;
-    const offCtx = offCanvas.getContext('2d');
-
-    const sx = sourceX - r;
-    const sy = sourceY - r;
-
-    // Extract the square patch
-    offCtx.drawImage(outputCanvas, sx, sy, r * 2, r * 2, 0, 0, r * 2, r * 2);
-
-    // Apply radial gradient mask
-    offCtx.globalCompositeOperation = 'destination-in';
-    const gradient = offCtx.createRadialGradient(r, r, 0, r, r, r);
-    gradient.addColorStop(0, 'rgba(0, 0, 0, 1)');
-    gradient.addColorStop(0.6, 'rgba(0, 0, 0, 1)');
-    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-    offCtx.fillStyle = gradient;
-    offCtx.beginPath();
-    offCtx.arc(r, r, r, 0, Math.PI * 2);
-    offCtx.fill();
-
-    return offCanvas;
-  }
-
   // 1. Extract both
-  const leftEyeCanvas = extractEye(leftX, leftY, radius);
-  const rightEyeCanvas = extractEye(rightX, rightY, radius);
+  const leftEyeCanvas = extractPatch(leftX, leftY, radius);
+  const rightEyeCanvas = extractPatch(rightX, rightY, radius);
 
   // 2. Draw them swapped
   canvasCtx.save();
@@ -306,6 +342,83 @@ function applyGhostEffect(landmarks, startX, startY, drawWidth, drawHeight, vide
   canvasCtx.scale(-1, 1);
   canvasCtx.drawImage(rightEyeCanvas, -radius, -radius);
 
+  canvasCtx.restore();
+}
+
+function applyUpsideDownEyesEffect(landmarks, startX, startY, drawWidth, drawHeight, videoWidth, videoHeight) {
+  const leftEyeIdx = 468;
+  const rightEyeIdx = 473;
+
+  const leftEyePt = landmarks[leftEyeIdx];
+  const rightEyePt = landmarks[rightEyeIdx];
+
+  if (!leftEyePt || !rightEyePt) return;
+
+  const leftPos = getLandmarkCanvasPos(leftEyePt, startX, startY, drawWidth, drawHeight);
+  const leftX = leftPos.x;
+  const leftY = leftPos.y;
+
+  const rightPos = getLandmarkCanvasPos(rightEyePt, startX, startY, drawWidth, drawHeight);
+  const rightX = rightPos.x;
+  const rightY = rightPos.y;
+
+  const eyeDistance = Math.sqrt(Math.pow(rightX - leftX, 2) + Math.pow(rightY - leftY, 2));
+  const radius = eyeDistance * 0.35;
+
+  const leftEyeCanvas = extractPatch(leftX, leftY, radius);
+  const rightEyeCanvas = extractPatch(rightX, rightY, radius);
+
+  canvasCtx.save();
+  canvasCtx.translate(leftX, leftY);
+  canvasCtx.scale(1, -1);
+  canvasCtx.drawImage(leftEyeCanvas, -radius, -radius);
+  canvasCtx.restore();
+
+  canvasCtx.save();
+  canvasCtx.translate(rightX, rightY);
+  canvasCtx.scale(1, -1);
+  canvasCtx.drawImage(rightEyeCanvas, -radius, -radius);
+  canvasCtx.restore();
+}
+
+function applyEnlargeIrisEffect(landmarks, startX, startY, drawWidth, drawHeight, videoWidth, videoHeight) {
+  // Iris centers
+  const leftIrisCenterIdx = 468;
+  const rightIrisCenterIdx = 473;
+
+  // Iris edge points to calculate radius
+  const leftIrisEdgeIdx = 469;
+  const rightIrisEdgeIdx = 474;
+
+  const leftIrisCenterPt = landmarks[leftIrisCenterIdx];
+  const rightIrisCenterPt = landmarks[rightIrisCenterIdx];
+  const leftIrisEdgePt = landmarks[leftIrisEdgeIdx];
+  const rightIrisEdgePt = landmarks[rightIrisEdgeIdx];
+
+  if (!leftIrisCenterPt || !rightIrisCenterPt || !leftIrisEdgePt || !rightIrisEdgePt) return;
+
+  const leftCenterPos = getLandmarkCanvasPos(leftIrisCenterPt, startX, startY, drawWidth, drawHeight);
+  const leftEdgePos = getLandmarkCanvasPos(leftIrisEdgePt, startX, startY, drawWidth, drawHeight);
+
+  const rightCenterPos = getLandmarkCanvasPos(rightIrisCenterPt, startX, startY, drawWidth, drawHeight);
+  const rightEdgePos = getLandmarkCanvasPos(rightIrisEdgePt, startX, startY, drawWidth, drawHeight);
+
+  const leftRadius = Math.sqrt(Math.pow(leftEdgePos.x - leftCenterPos.x, 2) + Math.pow(leftEdgePos.y - leftCenterPos.y, 2)) * 1.5; // Slightly larger capture area
+  const rightRadius = Math.sqrt(Math.pow(rightEdgePos.x - rightCenterPos.x, 2) + Math.pow(rightEdgePos.y - rightCenterPos.y, 2)) * 1.5;
+
+  const leftIrisCanvas = extractPatch(leftCenterPos.x, leftCenterPos.y, leftRadius);
+  const rightIrisCanvas = extractPatch(rightCenterPos.x, rightCenterPos.y, rightRadius);
+
+  canvasCtx.save();
+  canvasCtx.translate(leftCenterPos.x, leftCenterPos.y);
+  canvasCtx.scale(2, 2); // 2x enlargement
+  canvasCtx.drawImage(leftIrisCanvas, -leftRadius, -leftRadius);
+  canvasCtx.restore();
+
+  canvasCtx.save();
+  canvasCtx.translate(rightCenterPos.x, rightCenterPos.y);
+  canvasCtx.scale(2, 2); // 2x enlargement
+  canvasCtx.drawImage(rightIrisCanvas, -rightRadius, -rightRadius);
   canvasCtx.restore();
 }
 
